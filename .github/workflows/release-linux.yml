@@ -1,0 +1,48 @@
+name: Release (x86_64 linux)
+
+# Manual. Builds the `neon-lsp` binary for x86_64 Linux and attaches it to a GitHub
+# Release, which is what `neon`'s install.sh downloads to place `neon-lsp` on PATH alongside
+# the toolchain. One workflow per target (the mac half is release-macos.yml); dispatch each
+# for the same tag and both assets land on the one release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          set -eux
+          dir=neon-lsp-x86_64-linux
+          mkdir -p "$dir"
+          cp target/release/neon-lsp "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+
+      - name: Publish to release ${{ inputs.tag }}
+        run: |
+          set -eux
+          gh release view "${{ inputs.tag }}" >/dev/null 2>&1 \
+            || gh release create "${{ inputs.tag }}" --title "${{ inputs.tag }}" --notes "neon-lsp ${{ inputs.tag }}"
+          gh release upload "${{ inputs.tag }}" neon-lsp-x86_64-linux.tar.gz --clobber
