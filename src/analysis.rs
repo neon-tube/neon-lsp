@@ -231,8 +231,16 @@ impl Analyzer {
         // Every diagnostic of the run, resolution errors included: `check_all` drains the
         // environment's channel into what it returns, so an unknown type written inside a
         // body reaches the editor rather than vanishing.
+        //
+        // Only errors whose module is the root belong to THIS document. An error
+        // raised in a stdlib module carries a span into that module's source; anchored
+        // here it would underline whatever token happens to sit at the same byte
+        // offset in the user's file. A broken stdlib is a broken toolchain, not
+        // something the open buffer can fix, so those are dropped rather than
+        // mis-attached.
         let (result, errs) = neon_compiler::typecheck::check::check_all(&mut env, &modules);
-        let diagnostics = errs.iter().map(convert).collect();
+        let diagnostics =
+            errs.iter().filter(|e| e.module.is_empty()).map(convert).collect();
 
         // `modules` borrows `module`, and `Checked` owns it — so the borrow has to end
         // before the move. Nothing above needs it past this point.

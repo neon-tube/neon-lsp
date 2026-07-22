@@ -717,7 +717,10 @@ pub fn semantic_tokens(checked: &Checked, index: &LineIndex) -> Vec<SemanticToke
             // A `const` highlights as a variable. LSP has no `constant` token type -- the
             // convention is `variable` plus a `readonly` modifier, and this server does not
             // send modifiers, so widening the legend would buy nothing a client can use.
-            DefKind::Local | DefKind::Const => TOK_VARIABLE,
+            // A refinement is a narrowed shadow of an existing binding (`if x is T`, a
+            // match arm's rebound scrutinee), so a use through one colours as the
+            // variable it shadows.
+            DefKind::Local | DefKind::Const | DefKind::Refinement => TOK_VARIABLE,
         };
         found.push((e.span.clone(), kind));
     });
@@ -839,11 +842,13 @@ mod tests {
     /// plumbing worth having.
     fn analyzer() -> Analyzer {
         // The stdlib is the sibling `neon` repo's, not this one's. `NEON_STDLIB` points CI
-        // (and anyone running these tests) at a checkout of it; the `../stdlib` fallback is
-        // the old monorepo layout, kept so a side-by-side checkout still works.
+        // (and anyone running these tests) at a checkout of it; the fallback is a
+        // side-by-side checkout of the language repo, `../neon/stdlib`.
         let dir = std::env::var_os("NEON_STDLIB")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../stdlib"));
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../neon/stdlib")
+            });
         let mut sources = Vec::new();
         collect(&dir, &dir, &mut sources);
         sources.sort();
