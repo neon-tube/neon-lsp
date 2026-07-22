@@ -1,0 +1,33 @@
+[package]
+name = "neon-lsp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "neon-lsp"
+path = "src/main.rs"
+
+# `lsp-server` and `lsp-types` rather than `tower-lsp`: the protocol loop here is
+# synchronous and single-threaded, and a check is a blocking CPU pass over a whole module,
+# so an async runtime would buy nothing and cost a tokio dependency in a workspace that
+# has none. These are the crates rust-analyzer uses for the same reason.
+[dependencies]
+# The channel type `lsp-server` hands out. Named directly only for `recv_timeout`'s error
+# type, which the debounce in `main.rs` matches on; the version tracks lsp-server's so the
+# two share one copy of the crate rather than disagreeing about the type.
+crossbeam-channel = "0.5"
+lsp-server = "0.10"
+lsp-types = "0.97"
+# `lsp-types` 0.97 replaced `Url` (the `url` crate) with `Uri` (`fluent-uri`), which
+# models a URI but will not build one from a filesystem path. Go-to-definition has to:
+# a stdlib jump names a `PathBuf` and must hand back a `file://` URI, and hand-rolling
+# that means hand-rolling percent-encoding, which is how a path with a space in it
+# silently stops resolving. So the conversion crate is named directly rather than
+# reimplemented; 0.95 depended on it transitively for the same job.
+url = "2"
+# Split out of the monorepo: the compiler is its own repo now, pulled as a git
+# dependency. Pin to a rev once the API settles; the default branch is fine while both
+# repos move together.
+neon-compiler = { git = "https://github.com/neon-tube/neon.git" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
