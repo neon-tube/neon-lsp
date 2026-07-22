@@ -838,7 +838,12 @@ mod tests {
     /// and a stub stdlib would test the plumbing while missing everything that makes the
     /// plumbing worth having.
     fn analyzer() -> Analyzer {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../stdlib");
+        // The stdlib is the sibling `neon` repo's, not this one's. `NEON_STDLIB` points CI
+        // (and anyone running these tests) at a checkout of it; the `../stdlib` fallback is
+        // the old monorepo layout, kept so a side-by-side checkout still works.
+        let dir = std::env::var_os("NEON_STDLIB")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../stdlib"));
         let mut sources = Vec::new();
         collect(&dir, &dir, &mut sources);
         sources.sort();

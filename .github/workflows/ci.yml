@@ -35,5 +35,12 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      # The feature tests check the server against the real stdlib, which lives in the neon
+      # repo, not here. Shallow-clone it and point the tests at it.
+      - name: Fetch stdlib
+        run: |
+          git clone --depth 1 https://github.com/neon-tube/neon neon-src
+          echo "NEON_STDLIB=$PWD/neon-src/stdlib" >> "$GITHUB_ENV"
+
       - name: Test
         run: cargo test --locked
