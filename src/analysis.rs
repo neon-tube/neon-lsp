@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 /// One diagnostic, in byte offsets. Converting to LSP's line/column pairs is the
 /// protocol layer's job — this stays in the compiler's own coordinate system so nothing
 /// here has to think about UTF-16.
+#[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub span: Range<usize>,
     pub message: String,
@@ -41,6 +42,17 @@ pub struct Diagnostic {
     /// The lint name for a warning — the compiler's typed `Lint` spelled out — so the
     /// editor can show a code and a client can key quick-fixes (`@allow(...)`) off it.
     pub code: Option<&'static str>,
+    /// A mechanical fix, when the checker computed one. Typed rather than parsed back
+    /// out of the help text: the compiler's `Suggestion` is the single source and this
+    /// is its editor-facing face.
+    pub fix: Option<Fix>,
+}
+
+/// What a quick-fix would do.
+#[derive(Debug, Clone)]
+pub enum Fix {
+    /// Insert `use <path>;` with the document's other imports.
+    InsertUse(String),
 }
 
 /// Error or warning, the only two severities the compiler produces. Its own enum rather
@@ -61,6 +73,7 @@ impl Diagnostic {
             help: None,
             severity: Severity::Error,
             code: None,
+            fix: None,
         }
     }
 }
@@ -274,6 +287,7 @@ impl Analyzer {
                 help: None,
                 severity: Severity::Warning,
                 code: Some(w.lint.name()),
+                fix: None,
             }
         }));
 
@@ -297,6 +311,17 @@ fn config() -> expand::Config {
 /// A checker error, with the labels and help it carries. Both are dropped by the plain
 /// path above because lexer and parser errors have neither.
 fn convert(e: &neon_compiler::typecheck::env::TypeError) -> Diagnostic {
+    use neon_compiler::typecheck::env::{Suggestion, TypeErrorKind};
+    // The one mechanical fix the checker computes today: the missing import behind an
+    // unknown name. DidYouMean stays a help line — replacing what the user typed is a
+    // judgement, adding an import is not.
+    let fix = match &e.kind {
+        TypeErrorKind::UnknownName { suggestion: Some(Suggestion::AddUse { path, .. }), .. }
+        | TypeErrorKind::Unknown { suggestion: Some(Suggestion::AddUse { path, .. }), .. } => {
+            Some(Fix::InsertUse(path.clone()))
+        }
+        _ => None,
+    };
     Diagnostic {
         span: e.span.clone(),
         message: e.to_string(),
@@ -304,5 +329,6 @@ fn convert(e: &neon_compiler::typecheck::env::TypeError) -> Diagnostic {
         help: e.help(),
         severity: Severity::Error,
         code: None,
+        fix,
     }
 }

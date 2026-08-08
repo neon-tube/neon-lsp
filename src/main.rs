@@ -44,9 +44,9 @@ use lsp_types::notification::{
     LogMessage, Notification as _, PublishDiagnostics, ShowMessage,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDefinition,
-    HoverRequest, InlayHintRequest, References, Rename, Request as _, SelectionRangeRequest,
-    SemanticTokensFullRequest, SignatureHelpRequest,
+    CodeActionRequest, Completion, DocumentSymbolRequest, FoldingRangeRequest, Formatting,
+    GotoDefinition, HoverRequest, InlayHintRequest, References, Rename, Request as _,
+    SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DiagnosticRelatedInformation, DiagnosticSeverity,
@@ -89,6 +89,9 @@ const MAX_DELAY: Duration = Duration::from_millis(750);
 struct Doc {
     index: LineIndex,
     checked: Option<analysis::Checked>,
+    /// The diagnostics of the last publish, kept so a code-action request — which
+    /// arrives with only a range — can be matched back to the typed fixes.
+    diags: Vec<analysis::Diagnostic>,
 }
 
 /// Open documents, by URI. The editor's copy is authoritative — a file on disk may be
@@ -121,6 +124,9 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         // edits would only be bookkeeping on the way to reassembling the same string.
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        // Quick-fixes: insert a missing `use` (from the checker's typed suggestion) and
+        // `@allow(stale_write)` on the enclosing fn (from the warning's lint code).
+        code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
@@ -308,7 +314,7 @@ fn serve(
                         // is exactly the moment its answers are still worth having.
                         Some(doc) => doc.index = index,
                         None => {
-                            docs.insert(uri.clone(), Doc { index, checked: None });
+                            docs.insert(uri.clone(), Doc { index, checked: None, diags: Vec::new() });
                         }
                     }
                     let now = Instant::now();
@@ -404,6 +410,7 @@ fn empty_diagnostics(uri: &Uri) -> Notification {
 fn publish(uri: &Uri, doc: &mut Doc, analyzer: &analysis::Analyzer) -> Notification {
     let index = &doc.index;
     let analysis = analyzer.analyze(index.text());
+    doc.diags = analysis.diagnostics.clone();
     let diagnostics = analysis
         .diagnostics
         .into_iter()
@@ -456,6 +463,117 @@ fn publish(uri: &Uri, doc: &mut Doc, analyzer: &analysis::Analyzer) -> Notificat
     )
 }
 
+/// The quick-fixes for the diagnostics under the requested range.
+///
+/// Matched against the LAST PUBLISHED diagnostics rather than the client's
+/// `context.diagnostics`: the context echoes what the client happens to display, while
+/// `doc.diags` still carries the typed `Fix` the compiler computed — and the two
+/// describe the same publish, so the ranges agree.
+fn code_actions(
+    doc: &Doc,
+    uri: &Uri,
+    params: &lsp_types::CodeActionParams,
+) -> Vec<lsp_types::CodeActionOrCommand> {
+    let index = &doc.index;
+    let start = index.offset(params.range.start);
+    let end = index.offset(params.range.end);
+    let mut out = Vec::new();
+
+    for d in &doc.diags {
+        if d.span.end < start || d.span.start > end {
+            continue;
+        }
+        match (&d.fix, d.code) {
+            (Some(analysis::Fix::InsertUse(path)), _) => {
+                let at = index.position(use_insert_offset(index.text()));
+                out.push(quick_fix(
+                    format!("add `use {path};`"),
+                    uri,
+                    at,
+                    format!("use {path};{nl}", nl = '\n'),
+                ));
+            }
+            // The stale-write warning: opt the enclosing fn out. The lint code is the
+            // compiler's typed name for it, which is what makes this keyable at all.
+            (None, Some("stale_write")) => {
+                let Some(checked) = &doc.checked else { continue };
+                let Some(decl_start) = enclosing_fn_start(&checked.module.decls, &d.span)
+                else {
+                    continue;
+                };
+                let line_start = index.text()[..decl_start]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let indent: String = index.text()[line_start..decl_start]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect();
+                out.push(quick_fix(
+                    "allow this: `@allow(stale_write)` on the enclosing fn".into(),
+                    uri,
+                    index.position(line_start),
+                    format!("{indent}@allow(stale_write){nl}", nl = '\n'),
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Where a new `use` line belongs: after the last existing top-level `use`, else the
+/// top of the file.
+fn use_insert_offset(text: &str) -> usize {
+    let mut at = 0;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("use ") {
+            at = offset + line.len();
+        }
+        offset += line.len();
+    }
+    at
+}
+
+/// The start offset of the fn declaration containing `span`, searched through nested
+/// modules. `Decl::span` covers the whole declaration, body included, which is exactly
+/// the containment this needs.
+fn enclosing_fn_start(
+    decls: &[neon_compiler::ast::Decl],
+    span: &std::ops::Range<usize>,
+) -> Option<usize> {
+    use neon_compiler::ast::DeclKind;
+    for d in decls {
+        if d.span.start <= span.start && span.end <= d.span.end {
+            match &d.kind {
+                DeclKind::Fn(_) => return Some(d.span.start),
+                DeclKind::Mod(m) => return enclosing_fn_start(&m.decls, span),
+                DeclKind::Impl(_) => return Some(d.span.start),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn quick_fix(
+    title: String,
+    uri: &Uri,
+    at: lsp_types::Position,
+    insert: String,
+) -> lsp_types::CodeActionOrCommand {
+    let edit = lsp_types::TextEdit { range: Range { start: at, end: at }, new_text: insert };
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+    lsp_types::CodeActionOrCommand::CodeAction(lsp_types::CodeAction {
+        title,
+        kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+        edit: Some(lsp_types::WorkspaceEdit { changes: Some(changes), ..Default::default() }),
+        ..Default::default()
+    })
+}
+
 /// Whether answering this request means reading a `Checked`.
 ///
 /// Formatting is the one handled request that does not: it reprints from the document
@@ -464,6 +582,7 @@ fn needs_analysis(method: &str) -> bool {
     matches!(
         method,
         HoverRequest::METHOD
+            | CodeActionRequest::METHOD
             | GotoDefinition::METHOD
             | References::METHOD
             | Rename::METHOD
@@ -501,6 +620,18 @@ fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analy
     match req.method.as_str() {
         Formatting::METHOD => match cast::<Formatting>(req) {
             Ok((id, params)) => format_document(id, params, docs),
+            Err(err) => err,
+        },
+
+        CodeActionRequest::METHOD => match cast::<CodeActionRequest>(req) {
+            Ok((id, params)) => {
+                let uri = params.text_document.uri.clone();
+                let actions = docs
+                    .get(&uri)
+                    .map(|doc| code_actions(doc, &uri, &params))
+                    .unwrap_or_default();
+                Response::new_ok(id, actions)
+            }
             Err(err) => err,
         },
 
