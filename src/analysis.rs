@@ -37,11 +37,31 @@ pub struct Diagnostic {
     /// information so an editor can offer to jump to them.
     pub labels: Vec<(Range<usize>, String)>,
     pub help: Option<String>,
+    pub severity: Severity,
+    /// The lint name for a warning — the compiler's typed `Lint` spelled out — so the
+    /// editor can show a code and a client can key quick-fixes (`@allow(...)`) off it.
+    pub code: Option<&'static str>,
+}
+
+/// Error or warning, the only two severities the compiler produces. Its own enum rather
+/// than `lsp_types::DiagnosticSeverity` so this module keeps compiling without the
+/// protocol crate in scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
 }
 
 impl Diagnostic {
     fn plain(span: Range<usize>, message: String) -> Self {
-        Diagnostic { span, message, labels: Vec::new(), help: None }
+        Diagnostic {
+            span,
+            message,
+            labels: Vec::new(),
+            help: None,
+            severity: Severity::Error,
+            code: None,
+        }
     }
 }
 
@@ -239,8 +259,23 @@ impl Analyzer {
         // something the open buffer can fix, so those are dropped rather than
         // mis-attached.
         let (result, errs) = neon_compiler::typecheck::check::check_all(&mut env, &modules);
-        let diagnostics =
+        let mut diagnostics: Vec<Diagnostic> =
             errs.iter().filter(|e| e.module.is_empty()).map(convert).collect();
+
+        // The checker's warnings, on the same terms as its errors: root-module only —
+        // a stdlib warning carries a span into the stdlib's own source, and there is
+        // nothing the open buffer can do about it. A warning never blocks `checked`
+        // below, so hover and navigation still come from a warned-but-clean check.
+        diagnostics.extend(result.warnings.iter().filter(|w| w.module.is_empty()).map(|w| {
+            Diagnostic {
+                span: w.span.clone(),
+                message: w.message.clone(),
+                labels: Vec::new(),
+                help: None,
+                severity: Severity::Warning,
+                code: Some(w.lint.name()),
+            }
+        }));
 
         // `modules` borrows `module`, and `Checked` owns it — so the borrow has to end
         // before the move. Nothing above needs it past this point.
@@ -267,5 +302,7 @@ fn convert(e: &neon_compiler::typecheck::env::TypeError) -> Diagnostic {
         message: e.to_string(),
         labels: e.labels(),
         help: e.help(),
+        severity: Severity::Error,
+        code: None,
     }
 }

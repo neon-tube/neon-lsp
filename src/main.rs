@@ -412,7 +412,13 @@ fn publish(uri: &Uri, doc: &mut Doc, analyzer: &analysis::Analyzer) -> Notificat
                 start: index.position(d.span.start),
                 end: index.position(d.span.end),
             },
-            severity: Some(DiagnosticSeverity::ERROR),
+            severity: Some(match d.severity {
+                analysis::Severity::Error => DiagnosticSeverity::ERROR,
+                analysis::Severity::Warning => DiagnosticSeverity::WARNING,
+            }),
+            // The typed lint's name — "stale_write" — shown as the diagnostic code and
+            // stable enough for a client to key an `@allow(...)` quick-fix off.
+            code: d.code.map(|c| lsp_types::NumberOrString::String(c.into())),
             source: Some("neon".into()),
             message: match d.help {
                 // The help text is the actionable half of most of these messages, and an

@@ -316,7 +316,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "neon-compiler"
 version = "0.1.0"
-source = "git+https://github.com/neon-tube/neon.git#58dca637addd508157451f0d2972dbea04173a39"
 dependencies = [
  "ariadne",
  "chumsky",
@@ -341,7 +340,6 @@ dependencies = [
 [[package]]
 name = "neon-runtime"
 version = "0.1.0"
-source = "git+https://github.com/neon-tube/neon.git#58dca637addd508157451f0d2972dbea04173a39"
 dependencies = [
  "cmake",
 ]
