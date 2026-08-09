@@ -20,7 +20,7 @@ use lsp_types::{
     SignatureHelp, SignatureInformation, SymbolKind, Uri,
 };
 use neon_compiler::ast::{self, Expr, ExprId};
-use neon_compiler::lexer::{Span, TriviaKind};
+use neon_compiler::lexer::Span;
 use neon_compiler::typecheck::env::FnSig;
 use neon_compiler::typecheck::print;
 use neon_compiler::typecheck::result::{DefKind, DefSite};
@@ -28,7 +28,10 @@ use neon_compiler::typecheck::{Env, TyId};
 
 /// A span turned into an LSP range within one file.
 fn range(index: &LineIndex, span: &Span) -> Range {
-    Range { start: index.position(span.start), end: index.position(span.end) }
+    Range {
+        start: index.position(span.start),
+        end: index.position(span.end),
+    }
 }
 
 /// `ty` as Neon type syntax.
@@ -53,8 +56,13 @@ pub use neon_compiler::lexer::doc_above;
 /// A user's own function is documented in the document being edited; a stdlib function is
 /// documented in a file the server parsed at startup. Both are answered here so no caller
 /// has to know which kind it is holding.
-fn doc_for(analyzer: &Analyzer, current: &LineIndex, site: &DefSite) -> Option<String> {
-    match analyzer.source_of(&site.module) {
+fn doc_for(
+    analyzer: &Analyzer,
+    checked: &Checked,
+    current: &LineIndex,
+    site: &DefSite,
+) -> Option<String> {
+    match checked.source_of(analyzer, &site.module) {
         Some(src) => doc_above(src.index.text(), &src.trivia, &site.span),
         // The module is not a stdlib one, so it is the user's own file. Its trivia is not
         // kept — it is re-lexed here rather than on every keystroke, since hovering is
@@ -90,8 +98,11 @@ pub fn signature(env: &mut Env, sig: &FnSig) -> String {
     // `never` is how "no `throws` clause" is spelled internally; printing it would put a
     // clause on every non-throwing function in the stdlib.
     let never = env.solver.t.never();
-    let throws =
-        if sig.throws == never { String::new() } else { format!(" throws {}", show(env, sig.throws)) };
+    let throws = if sig.throws == never {
+        String::new()
+    } else {
+        format!(" throws {}", show(env, sig.throws))
+    };
 
     let wheres = if sig.wheres.is_empty() {
         String::new()
@@ -106,7 +117,10 @@ pub fn signature(env: &mut Env, sig: &FnSig) -> String {
     };
 
     let ret = show(env, sig.ret);
-    format!("fn {}{generics}({params}){throws} -> {ret}{wheres}", sig.name)
+    format!(
+        "fn {}{generics}({params}){throws} -> {ret}{wheres}",
+        sig.name
+    )
 }
 
 /// Fence a piece of Neon source for display in an editor's hover popup.
@@ -135,7 +149,11 @@ pub fn hover(
     // `expr_types`. Both must answer, because hovering the `x` in `let x = ...` to ask
     // what it is is at least as common as hovering a use of it.
     let (id, span, site) = match ast::visit::innermost_at(&checked.module, offset) {
-        Some(expr) => (Some(expr.id), expr.span.clone(), checked.result.def(expr.id).cloned()),
+        Some(expr) => (
+            Some(expr.id),
+            expr.span.clone(),
+            checked.result.def(expr.id).cloned(),
+        ),
         None => {
             let site = binding_at(checked, offset)?;
             let id = type_carrier(checked, &site);
@@ -161,7 +179,7 @@ pub fn hover(
     }
 
     if let Some(site) = site {
-        if let Some(doc) = doc_for(analyzer, index, &site) {
+        if let Some(doc) = doc_for(analyzer, checked, index, &site) {
             parts.push(doc);
         }
         // Where it came from, but only when that is not "right here" — labelling every
@@ -181,7 +199,12 @@ pub fn hover(
 /// The binding whose own span contains `offset` — the cursor on a declaration rather
 /// than a use.
 fn binding_at(checked: &Checked, offset: usize) -> Option<DefSite> {
-    checked.result.defs().map(|(_, d)| d).find(|d| d.span.contains(&offset)).cloned()
+    checked
+        .result
+        .defs()
+        .map(|(_, d)| d)
+        .find(|d| d.span.contains(&offset))
+        .cloned()
 }
 
 /// An expression whose type is the type of `site`.
@@ -194,14 +217,21 @@ fn binding_at(checked: &Checked, offset: usize) -> Option<DefSite> {
 /// there is nothing in the program that fixes its type.
 fn type_carrier(checked: &Checked, site: &DefSite) -> Option<ExprId> {
     let mut found = None;
-    let mut v = LetOf { want: &site.span, found: &mut found };
+    let mut v = LetOf {
+        want: &site.span,
+        found: &mut found,
+    };
     for d in &checked.module.decls {
         ast::visit::walk_decl(&mut v, d);
     }
     if found.is_some() {
         return found;
     }
-    checked.result.defs().find(|(_, d)| *d == site).map(|(e, _)| e)
+    checked
+        .result
+        .defs()
+        .find(|(_, d)| *d == site)
+        .map(|(e, _)| e)
 }
 
 /// Finds the initialiser of the `let` that binds a given span.
@@ -226,7 +256,9 @@ impl<'a> ast::visit::Visitor<'a> for LetOf<'_> {
 /// Matched on span rather than name: two functions in different modules share a name
 /// often, and the span is what the checker actually recorded.
 fn fn_at<'e>(env: &'e Env, site: &DefSite) -> Option<&'e FnSig> {
-    env.fns().iter().find(|f| f.span == site.span && f.module == site.module)
+    env.fns()
+        .iter()
+        .find(|f| f.span == site.span && f.module == site.module)
 }
 
 // ---- go to definition ----
@@ -242,7 +274,7 @@ pub fn definition(
     let offset = index.offset(pos);
     let expr = ast::visit::innermost_at(&checked.module, offset)?;
     let site = checked.result.def(expr.id)?;
-    locate(analyzer, index, uri, site)
+    locate(analyzer, checked, index, uri, site)
 }
 
 /// A `DefSite` as a location an editor can open.
@@ -254,9 +286,18 @@ pub fn definition(
 /// off emptiness therefore lost every name declared inside a `mod` block: `source_of`
 /// found no stdlib file called `inner`, and go-to-definition, find-references and rename
 /// all silently returned nothing inside one.
-fn locate(analyzer: &Analyzer, index: &LineIndex, uri: &Uri, site: &DefSite) -> Option<Location> {
-    let Some(src) = analyzer.source_of(&site.module) else {
-        return Some(Location { uri: uri.clone(), range: range(index, &site.span) });
+fn locate(
+    analyzer: &Analyzer,
+    checked: &Checked,
+    index: &LineIndex,
+    uri: &Uri,
+    site: &DefSite,
+) -> Option<Location> {
+    let Some(src) = checked.source_of(analyzer, &site.module) else {
+        return Some(Location {
+            uri: uri.clone(),
+            range: range(index, &site.span),
+        });
     };
     let src: &Source = src;
     // Through `url` and back out as a string: it is the only one of the two that knows
@@ -264,7 +305,10 @@ fn locate(analyzer: &Analyzer, index: &LineIndex, uri: &Uri, site: &DefSite) -> 
     // accepts.
     let target = url::Url::from_file_path(&src.path).ok()?;
     let target: Uri = target.as_str().parse().ok()?;
-    Some(Location { uri: target, range: range(&src.index, &site.span) })
+    Some(Location {
+        uri: target,
+        range: range(&src.index, &site.span),
+    })
 }
 
 // ---- find references, rename ----
@@ -284,12 +328,14 @@ pub fn references(
     index: &LineIndex,
     pos: Position,
 ) -> Vec<Range> {
-    let Some(target) = site_under(checked, index, pos) else { return Vec::new() };
+    let Some(target) = site_under(checked, index, pos) else {
+        return Vec::new();
+    };
 
     let mut spans: Vec<Span> = spans_of(checked, &target);
     // The definition too, when it is in this file — see `locate` for why the test is
     // "not a stdlib module" rather than "no module".
-    if analyzer_has_no_source(analyzer, &target) {
+    if analyzer_has_no_source(analyzer, checked, &target) {
         spans.push(target.span.clone());
     }
 
@@ -303,8 +349,8 @@ pub fn references(
 /// Phrased as "the analyzer has no file for this module", because that is the only thing
 /// that reliably distinguishes the two: the stdlib's modules are exactly the ones parsed
 /// from files at startup, and everything else — root or nested `mod` alike — is the user's.
-fn analyzer_has_no_source(analyzer: &Analyzer, site: &DefSite) -> bool {
-    analyzer.source_of(&site.module).is_none()
+fn analyzer_has_no_source(analyzer: &Analyzer, checked: &Checked, site: &DefSite) -> bool {
+    checked.source_of(analyzer, &site.module).is_none()
 }
 
 /// The spans in this module of every name resolving to `target`.
@@ -363,7 +409,7 @@ pub fn rename(
     pos: Position,
 ) -> Option<Vec<Range>> {
     let target = site_under(checked, index, pos)?;
-    if !analyzer_has_no_source(analyzer, &target) {
+    if !analyzer_has_no_source(analyzer, checked, &target) {
         return None;
     }
     let mut spans = spans_of(checked, &target);
@@ -495,13 +541,15 @@ pub fn completions(
             continue;
         }
         let detail = signature(&mut checked.env, &sig);
-        let documentation = analyzer
-            .source_of(&sig.module)
+        let documentation = checked
+            .source_of(analyzer, &sig.module)
             .and_then(|src| doc_above(src.index.text(), &src.trivia, &sig.span))
-            .map(|value| Documentation::MarkupContent(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value,
-            }));
+            .map(|value| {
+                Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                })
+            });
 
         out.push(CompletionItem {
             label: sig.name.clone(),
@@ -510,7 +558,11 @@ pub fn completions(
             documentation,
             // Qualified names sort after bare ones so the prelude, which is what people
             // mean most of the time, is not buried under `std::`.
-            sort_text: Some(format!("{}{}", if sig.module.is_empty() { "0" } else { "1" }, sig.name)),
+            sort_text: Some(format!(
+                "{}{}",
+                if sig.module.is_empty() { "0" } else { "1" },
+                sig.name
+            )),
             ..Default::default()
         });
     }
@@ -532,7 +584,9 @@ fn locals_in_scope(checked: &Checked, text: &str, offset: usize) -> Vec<(String,
         .iter()
         .find(|d| d.span.contains(&offset))
         .map(|d| d.span.clone());
-    let Some(enclosing) = enclosing else { return Vec::new() };
+    let Some(enclosing) = enclosing else {
+        return Vec::new();
+    };
 
     let mut seen: Vec<(String, TyId, DefKind)> = Vec::new();
     for (id, site) in checked.result.defs() {
@@ -542,10 +596,14 @@ fn locals_in_scope(checked: &Checked, text: &str, offset: usize) -> Vec<(String,
         if site.span.start > offset {
             continue;
         }
-        let Some(ty) = checked.result.ty(id) else { continue };
+        let Some(ty) = checked.result.ty(id) else {
+            continue;
+        };
         // A binding's span is exactly its name, so the source text is the lookup — the
         // AST stores the name on the `Pattern`, which a `DefSite` cannot reach.
-        let Some(name) = text.get(site.span.clone()) else { continue };
+        let Some(name) = text.get(site.span.clone()) else {
+            continue;
+        };
         if !seen.iter().any(|(n, ..)| n == name) {
             seen.push((name.to_string(), ty, site.kind));
         }
@@ -567,11 +625,16 @@ pub fn signature_help(
     // the cursor is on an argument, and the argument is not the thing being described.
     let mut best: Option<(&Expr, &Expr, usize)> = None;
     ast::visit::each_expr(&checked.module, |e| {
-        let ast::ExprKind::Call { callee, args, .. } = &e.kind else { return };
+        let ast::ExprKind::Call { callee, args, .. } = &e.kind else {
+            return;
+        };
         if !e.span.contains(&offset) {
             return;
         }
-        let active = args.iter().position(|a| a.span.contains(&offset)).unwrap_or(args.len().saturating_sub(1));
+        let active = args
+            .iter()
+            .position(|a| a.span.contains(&offset))
+            .unwrap_or(args.len().saturating_sub(1));
         let width = e.span.end - e.span.start;
         if best.is_none_or(|(b, ..)| width <= b.span.end - b.span.start) {
             best = Some((e, callee, active));
@@ -615,8 +678,13 @@ pub fn inlay_hints(checked: &mut Checked, index: &LineIndex) -> Vec<(Position, S
 
     collect_lets(&checked.module.decls, &mut pending);
     for (span, value) in pending {
-        let Some(ty) = checked.result.ty(value) else { continue };
-        out.push((index.position(span.end), format!(": {}", show(&mut checked.env, ty))));
+        let Some(ty) = checked.result.ty(value) else {
+            continue;
+        };
+        out.push((
+            index.position(span.end),
+            format!(": {}", show(&mut checked.env, ty)),
+        ));
     }
     out
 }
@@ -625,7 +693,13 @@ fn collect_lets(decls: &[ast::Decl], out: &mut Vec<(Span, ExprId)>) {
     struct V<'o>(&'o mut Vec<(Span, ExprId)>);
     impl<'a> ast::visit::Visitor<'a> for V<'_> {
         fn stmt(&mut self, s: &'a ast::Stmt) {
-            if let ast::StmtKind::Let { pat, value, ty: None, .. } = &s.kind {
+            if let ast::StmtKind::Let {
+                pat,
+                value,
+                ty: None,
+                ..
+            } = &s.kind
+            {
                 if matches!(pat.kind, ast::PatternKind::Bind(_)) {
                     self.0.push((pat.span.clone(), value.id));
                 }
@@ -674,7 +748,9 @@ pub fn semantic_tokens(checked: &Checked, index: &LineIndex) -> Vec<SemanticToke
         if !matches!(e.kind, ast::ExprKind::Path(_)) {
             return;
         }
-        let Some(site) = checked.result.def(e.id) else { return };
+        let Some(site) = checked.result.def(e.id) else {
+            return;
+        };
         let kind = match site.kind {
             DefKind::Fn => TOK_FUNCTION,
             DefKind::Param => TOK_PARAMETER,
@@ -692,7 +768,10 @@ pub fn semantic_tokens(checked: &Checked, index: &LineIndex) -> Vec<SemanticToke
     found.sort_by_key(|(s, _)| (s.start, s.end));
 
     let mut out = Vec::with_capacity(found.len());
-    let mut prev = Position { line: 0, character: 0 };
+    let mut prev = Position {
+        line: 0,
+        character: 0,
+    };
     for (span, token_type) in found {
         let at = index.position(span.start);
         // A span covering a newline would make `length` meaningless, since the protocol
@@ -702,7 +781,11 @@ pub fn semantic_tokens(checked: &Checked, index: &LineIndex) -> Vec<SemanticToke
             continue;
         }
         let delta_line = at.line - prev.line;
-        let delta_start = if delta_line == 0 { at.character - prev.character } else { at.character };
+        let delta_start = if delta_line == 0 {
+            at.character - prev.character
+        } else {
+            at.character
+        };
         out.push(SemanticToken {
             delta_line,
             delta_start,
@@ -835,18 +918,28 @@ mod tests {
 
     /// Check `src` and hand back what the features operate on.
     fn check(analyzer: &Analyzer, src: &str) -> (Checked, LineIndex) {
-        let analysis = analyzer.analyze(src);
+        let analysis = analyzer.analyze(None, src, &[]);
         assert!(
             analysis.diagnostics.is_empty(),
             "the fixture does not check: {:?}",
-            analysis.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            analysis
+                .diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
         );
-        (analysis.checked.expect("a clean file produces a check"), LineIndex::new(src))
+        (
+            analysis.checked.expect("a clean file produces a check"),
+            LineIndex::new(src),
+        )
     }
 
     /// The position of a substring, for writing fixtures without counting columns.
     fn at(index: &LineIndex, src: &str, needle: &str) -> Position {
-        index.position(src.find(needle).unwrap_or_else(|| panic!("`{needle}` is in the fixture")))
+        index.position(
+            src.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is in the fixture")),
+        )
     }
 
     const FIXTURE: &str = r##"use std::io::println;
@@ -865,12 +958,24 @@ fn main() {
     fn hover_on_a_call_shows_the_signature_and_its_documentation() {
         let a = analyzer();
         let (mut c, idx) = check(&a, FIXTURE);
-        let (content, _) = hover(&a, &mut c, &idx, at(&idx, FIXTURE, "add(1"))
-            .expect("a call has a hover");
-        assert!(content.value.contains("fn add(a: i64, b: i64) -> i64"), "{}", content.value);
+        let (content, _) =
+            hover(&a, &mut c, &idx, at(&idx, FIXTURE, "add(1")).expect("a call has a hover");
+        assert!(
+            content.value.contains("fn add(a: i64, b: i64) -> i64"),
+            "{}",
+            content.value
+        );
         // Both lines, and not the `use` line above them.
-        assert!(content.value.contains("Add two numbers."), "{}", content.value);
-        assert!(content.value.contains("The second line"), "{}", content.value);
+        assert!(
+            content.value.contains("Add two numbers."),
+            "{}",
+            content.value
+        );
+        assert!(
+            content.value.contains("The second line"),
+            "{}",
+            content.value
+        );
     }
 
     #[test]
@@ -879,7 +984,11 @@ fn main() {
         let (mut c, idx) = check(&a, FIXTURE);
         let (content, _) = hover(&a, &mut c, &idx, at(&idx, FIXTURE, "println(\""))
             .expect("a stdlib call has a hover");
-        assert!(content.value.contains("fn println(s: str)"), "{}", content.value);
+        assert!(
+            content.value.contains("fn println(s: str)"),
+            "{}",
+            content.value
+        );
         assert!(content.value.contains("std::io"), "{}", content.value);
     }
 
@@ -889,8 +998,8 @@ fn main() {
     fn hover_on_a_binding_shows_its_inferred_type() {
         let a = analyzer();
         let (mut c, idx) = check(&a, FIXTURE);
-        let (content, _) = hover(&a, &mut c, &idx, at(&idx, FIXTURE, "total ="))
-            .expect("a binding has a hover");
+        let (content, _) =
+            hover(&a, &mut c, &idx, at(&idx, FIXTURE, "total =")).expect("a binding has a hover");
         assert!(content.value.contains("i64"), "{}", content.value);
     }
 
@@ -898,17 +1007,25 @@ fn main() {
     fn definition_of_a_stdlib_name_points_into_the_stdlib() {
         let a = analyzer();
         let (c, idx) = check(&a, FIXTURE);
-        let uri: Uri = "file:///fixture.neon".parse().expect("the fixture URI parses");
+        let uri: Uri = "file:///fixture.neon"
+            .parse()
+            .expect("the fixture URI parses");
         let loc = definition(&a, &c, &idx, &uri, at(&idx, FIXTURE, "println(\""))
             .expect("a stdlib name has a definition");
-        assert!(loc.uri.path().as_str().ends_with("std/io.neon"), "landed at {:?}", loc.uri);
+        assert!(
+            loc.uri.path().as_str().ends_with("std/io.neon"),
+            "landed at {:?}",
+            loc.uri
+        );
     }
 
     #[test]
     fn definition_of_a_local_name_stays_in_this_file() {
         let a = analyzer();
         let (c, idx) = check(&a, FIXTURE);
-        let uri: Uri = "file:///fixture.neon".parse().expect("the fixture URI parses");
+        let uri: Uri = "file:///fixture.neon"
+            .parse()
+            .expect("the fixture URI parses");
         let loc = definition(&a, &c, &idx, &uri, at(&idx, FIXTURE, "add(1"))
             .expect("a local fn has a definition");
         assert_eq!(loc.uri, uri);
@@ -926,11 +1043,17 @@ fn main() {
         let inner = references(&a, &c, &idx, at(&idx, src, "x = 2"));
         // The inner binding and the `x` in `let y = x`, and nothing on lines 1 or 3.
         assert_eq!(inner.len(), 2, "inner `x`: {inner:?}");
-        assert!(inner.iter().all(|r| r.start.line == 2), "inner `x` escaped its block: {inner:?}");
+        assert!(
+            inner.iter().all(|r| r.start.line == 2),
+            "inner `x` escaped its block: {inner:?}"
+        );
 
         let outer = references(&a, &c, &idx, at(&idx, src, "x = 1"));
         assert_eq!(outer.len(), 2, "outer `x`: {outer:?}");
-        assert!(outer.iter().any(|r| r.start.line == 3), "outer `x` missed `let z = x`");
+        assert!(
+            outer.iter().any(|r| r.start.line == 3),
+            "outer `x` missed `let z = x`"
+        );
     }
 
     #[test]
@@ -947,7 +1070,8 @@ fn main() {
     fn rename_covers_the_binding_and_every_use() {
         let a = analyzer();
         let (c, idx) = check(&a, FIXTURE);
-        let edits = rename(&a, &c, &idx, at(&idx, FIXTURE, "total =")).expect("a local can be renamed");
+        let edits =
+            rename(&a, &c, &idx, at(&idx, FIXTURE, "total =")).expect("a local can be renamed");
         assert_eq!(edits.len(), 2, "the binding and the one use: {edits:?}");
     }
 
@@ -958,9 +1082,15 @@ fn main() {
         let items = completions(&a, &mut c, &idx, at(&idx, FIXTURE, "println(\""));
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"total"), "the local in scope is missing");
-        assert!(labels.contains(&"add"), "the file's own function is missing");
+        assert!(
+            labels.contains(&"add"),
+            "the file's own function is missing"
+        );
         // And the detail is the signature, which is the point of offering it.
-        let add = items.iter().find(|i| i.label == "add").expect("`add` is offered");
+        let add = items
+            .iter()
+            .find(|i| i.label == "add")
+            .expect("`add` is offered");
         assert_eq!(add.detail.as_deref(), Some("fn add(a: i64, b: i64) -> i64"));
     }
 
@@ -970,9 +1100,18 @@ fn main() {
         let (c, idx) = check(&a, FIXTURE);
         let toks = semantic_tokens(&c, &idx);
         let kinds: Vec<u32> = toks.iter().map(|t| t.token_type).collect();
-        assert!(kinds.contains(&TOK_PARAMETER), "no parameter token: {kinds:?}");
-        assert!(kinds.contains(&TOK_FUNCTION), "no function token: {kinds:?}");
-        assert!(kinds.contains(&TOK_VARIABLE), "no variable token: {kinds:?}");
+        assert!(
+            kinds.contains(&TOK_PARAMETER),
+            "no parameter token: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&TOK_FUNCTION),
+            "no function token: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&TOK_VARIABLE),
+            "no variable token: {kinds:?}"
+        );
     }
 
     /// The encoding is deltas, and a client renders garbage from the first out-of-order
@@ -985,7 +1124,10 @@ fn main() {
         for t in semantic_tokens(&c, &idx) {
             if t.delta_line == 0 {
                 // Within a line, a delta of zero would mean two tokens at one place.
-                assert!(t.delta_start > 0 || t.length == 0, "non-advancing token: {t:?}");
+                assert!(
+                    t.delta_start > 0 || t.length == 0,
+                    "non-advancing token: {t:?}"
+                );
             }
         }
     }
@@ -995,7 +1137,10 @@ fn main() {
         let a = analyzer();
         let (c, idx) = check(&a, FIXTURE);
         let chain = selection_range(&c, &idx, at(&idx, FIXTURE, "total ="));
-        assert!(chain.len() >= 2, "expected to widen at least once: {chain:?}");
+        assert!(
+            chain.len() >= 2,
+            "expected to widen at least once: {chain:?}"
+        );
         // Strictly widening, which is what makes repeated presses terminate.
         for pair in chain.windows(2) {
             let (inner, outer) = (pair[0], pair[1]);
@@ -1024,11 +1169,16 @@ fn main() {
         let src = "mod inner {\n    fn f() -> i64 {\n        let x = 1;\n        x\n    }\n}\n";
         let a = analyzer();
         let (c, idx) = check(&a, src);
-        let uri: Uri = "file:///fixture.neon".parse().expect("the fixture URI parses");
+        let uri: Uri = "file:///fixture.neon"
+            .parse()
+            .expect("the fixture URI parses");
 
         let loc = definition(&a, &c, &idx, &uri, at(&idx, src, "x\n    }"))
             .expect("a local inside a mod has a definition");
-        assert_eq!(loc.uri, uri, "it must point back at this file, not the stdlib");
+        assert_eq!(
+            loc.uri, uri,
+            "it must point back at this file, not the stdlib"
+        );
 
         assert!(
             rename(&a, &c, &idx, at(&idx, src, "x = 1")).is_some(),
@@ -1042,10 +1192,20 @@ fn main() {
         let a = analyzer();
         let (c, idx) = check(&a, src);
         let syms = document_symbols(&c, &idx);
-        let m = syms.iter().find(|s| s.name == "inner").expect("the module is listed");
-        assert_eq!(m.children.len(), 1, "the module's function is nested inside it");
+        let m = syms
+            .iter()
+            .find(|s| s.name == "inner")
+            .expect("the module is listed");
+        assert_eq!(
+            m.children.len(),
+            1,
+            "the module's function is nested inside it"
+        );
         assert_eq!(m.children[0].name, "f");
-        assert!(syms.iter().any(|s| s.name == "g"), "the top-level function is listed");
+        assert!(
+            syms.iter().any(|s| s.name == "g"),
+            "the top-level function is listed"
+        );
     }
 
     // ---- doc_above ----

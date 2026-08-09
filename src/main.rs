@@ -50,17 +50,18 @@ use lsp_types::request::{
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DiagnosticRelatedInformation, DiagnosticSeverity,
-    DocumentFormattingParams, DocumentSymbol, DocumentSymbolResponse, GotoDefinitionResponse, Hover,
-    HoverContents, HoverProviderCapability, InitializeParams, InlayHint, InlayHintKind,
-    InlayHintLabel, Location, LogMessageParams, MessageType, OneOf, PublishDiagnosticsParams,
-    FoldingRange, FoldingRangeKind, Range, SelectionRange, SemanticTokens, SemanticTokensFullOptions,
-    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
+    DocumentFormattingParams, DocumentSymbol, DocumentSymbolResponse, FoldingRange,
+    FoldingRangeKind, GotoDefinitionResponse, Hover, HoverContents, HoverProviderCapability,
+    InitializeParams, InlayHint, InlayHintKind, InlayHintLabel, Location, LogMessageParams,
+    MessageType, OneOf, PublishDiagnosticsParams, Range, SelectionRange, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ShowMessageParams, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use position::LineIndex;
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// How long the server waits for typing to stop before checking.
@@ -147,8 +148,8 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         }),
         folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(lsp_types::SelectionRangeProviderCapability::Simple(true)),
-        semantic_tokens_provider: Some(
-            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
                 legend: SemanticTokensLegend {
                     token_types: features::TOKEN_TYPES.to_vec(),
                     token_modifiers: Vec::new(),
@@ -159,8 +160,8 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
                 // the bookkeeping a delta would need.
                 full: Some(SemanticTokensFullOptions::Bool(true)),
                 ..Default::default()
-            }),
-        ),
+            },
+        )),
         ..Default::default()
     })?;
 
@@ -230,7 +231,11 @@ fn start_analyzer(
         connection,
         LogMessage::METHOD,
         LogMessageParams {
-            typ: if warn.is_some() { MessageType::WARNING } else { MessageType::INFO },
+            typ: if warn.is_some() {
+                MessageType::WARNING
+            } else {
+                MessageType::INFO
+            },
             message: log,
         },
     )?;
@@ -238,7 +243,10 @@ fn start_analyzer(
         notify(
             connection,
             ShowMessage::METHOD,
-            ShowMessageParams { typ: MessageType::WARNING, message },
+            ShowMessageParams {
+                typ: MessageType::WARNING,
+                message,
+            },
         )?;
     }
     Ok(analyzer)
@@ -298,7 +306,9 @@ fn serve(
                 // completion fires per keystroke in some editors, so forcing a check for
                 // every request would undo the debounce entirely.
                 if needs_analysis(&req.method) {
-                    let for_this_doc = pending.as_ref().is_some_and(|p| Some(&p.uri) == uri_of(&req).as_ref());
+                    let for_this_doc = pending
+                        .as_ref()
+                        .is_some_and(|p| Some(&p.uri) == uri_of(&req).as_ref());
                     if for_this_doc {
                         flush(connection, &mut docs, analyzer, pending.take())?;
                     }
@@ -314,7 +324,14 @@ fn serve(
                         // is exactly the moment its answers are still worth having.
                         Some(doc) => doc.index = index,
                         None => {
-                            docs.insert(uri.clone(), Doc { index, checked: None, diags: Vec::new() });
+                            docs.insert(
+                                uri.clone(),
+                                Doc {
+                                    index,
+                                    checked: None,
+                                    diags: Vec::new(),
+                                },
+                            );
                         }
                     }
                     let now = Instant::now();
@@ -326,9 +343,19 @@ fn serve(
                         // than letting edits elsewhere postpone it indefinitely.
                         Some(_) => {
                             flush(connection, &mut docs, analyzer, pending.take())?;
-                            pending = Some(Pending { uri, first: now, last: now });
+                            pending = Some(Pending {
+                                uri,
+                                first: now,
+                                last: now,
+                            });
                         }
-                        None => pending = Some(Pending { uri, first: now, last: now }),
+                        None => {
+                            pending = Some(Pending {
+                                uri,
+                                first: now,
+                                last: now,
+                            })
+                        }
                     }
                 }
                 Some(Event::Closed(uri)) => {
@@ -339,7 +366,9 @@ fn serve(
                     // An editor keeps showing the last set it was told about, so a closed
                     // file would otherwise leave stale errors in the problems panel
                     // forever. Not debounced: closing is a deliberate act, not a burst.
-                    connection.sender.send(Message::Notification(empty_diagnostics(&uri)))?;
+                    connection
+                        .sender
+                        .send(Message::Notification(empty_diagnostics(&uri)))?;
                 }
                 None => {}
             },
@@ -357,8 +386,12 @@ fn flush(
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let Some(p) = pending else { return Ok(()) };
     // Closed between the edit and the deadline: nothing to say about it.
-    let Some(doc) = docs.get_mut(&p.uri) else { return Ok(()) };
-    connection.sender.send(Message::Notification(publish(&p.uri, doc, analyzer)))?;
+    if !docs.contains_key(&p.uri) {
+        return Ok(());
+    }
+    for note in publish(&p.uri, docs, analyzer) {
+        connection.sender.send(Message::Notification(note))?;
+    }
     Ok(())
 }
 
@@ -371,7 +404,8 @@ enum Event {
 fn document_event(note: Notification) -> Option<Event> {
     match note.method.as_str() {
         DidOpenTextDocument::METHOD => {
-            let p: lsp_types::DidOpenTextDocumentParams = serde_json::from_value(note.params).ok()?;
+            let p: lsp_types::DidOpenTextDocumentParams =
+                serde_json::from_value(note.params).ok()?;
             Some(Event::Changed(p.text_document.uri, p.text_document.text))
         }
         DidChangeTextDocument::METHOD => {
@@ -382,7 +416,8 @@ fn document_event(note: Notification) -> Option<Event> {
             Some(Event::Changed(p.text_document.uri, text))
         }
         DidSaveTextDocument::METHOD => {
-            let p: lsp_types::DidSaveTextDocumentParams = serde_json::from_value(note.params).ok()?;
+            let p: lsp_types::DidSaveTextDocumentParams =
+                serde_json::from_value(note.params).ok()?;
             Some(Event::Changed(p.text_document.uri, p.text?))
         }
         DidCloseTextDocument::METHOD => {
@@ -397,22 +432,30 @@ fn document_event(note: Notification) -> Option<Event> {
 fn empty_diagnostics(uri: &Uri) -> Notification {
     Notification::new(
         PublishDiagnostics::METHOD.to_string(),
-        PublishDiagnosticsParams { uri: uri.clone(), diagnostics: Vec::new(), version: None },
+        PublishDiagnosticsParams {
+            uri: uri.clone(),
+            diagnostics: Vec::new(),
+            version: None,
+        },
     )
 }
 
-/// Check a document, keep the result, and build the notification carrying its diagnostics.
-///
-/// The check is the expensive part of the server and it now produces two things rather
-/// than one: the diagnostics, which go out immediately, and the `Checked`, which stays
-/// behind to answer hover and navigation. Doing both from one pass is the point — the
-/// alternative is re-checking the file the first time someone hovers over it.
-fn publish(uri: &Uri, doc: &mut Doc, analyzer: &analysis::Analyzer) -> Notification {
-    let index = &doc.index;
-    let analysis = analyzer.analyze(index.text());
-    doc.diags = analysis.diagnostics.clone();
-    let diagnostics = analysis
-        .diagnostics
+/// The filesystem path a document URI names, canonicalized when the file exists so it
+/// compares equal to paths found by walking the project.
+fn file_path(uri: &Uri) -> Option<PathBuf> {
+    let url = url::Url::parse(uri.as_str()).ok()?;
+    let p = url.to_file_path().ok()?;
+    Some(std::fs::canonicalize(&p).unwrap_or(p))
+}
+
+/// One module's diagnostics in protocol terms, positions computed against the text the
+/// spans actually index.
+fn to_lsp(
+    uri: &Uri,
+    index: &LineIndex,
+    diagnostics: Vec<analysis::Diagnostic>,
+) -> Vec<lsp_types::Diagnostic> {
+    diagnostics
         .into_iter()
         .map(|d| lsp_types::Diagnostic {
             range: Range {
@@ -450,17 +493,69 @@ fn publish(uri: &Uri, doc: &mut Doc, analyzer: &analysis::Analyzer) -> Notificat
             }),
             ..Default::default()
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// Check a document, keep the result, and build the notifications carrying its
+/// diagnostics — its own first, then one per sibling project file, empty when clean so
+/// a fixed error leaves the problems panel.
+///
+/// The check is the expensive part of the server and it produces two things rather
+/// than one: the diagnostics, which go out immediately, and the `Checked`, which stays
+/// behind to answer hover and navigation. Doing both from one pass is the point — the
+/// alternative is re-checking the file the first time someone hovers over it.
+fn publish(uri: &Uri, docs: &mut Documents, analyzer: &analysis::Analyzer) -> Vec<Notification> {
+    // Every open buffer's current text: the editor's copy is authoritative, and a
+    // sibling module open in the next split may be keystrokes ahead of its disk file.
+    let overlays: Vec<(PathBuf, String)> = docs
+        .iter()
+        .filter_map(|(u, d)| Some((file_path(u)?, d.index.text().to_string())))
+        .collect();
+    let Some(doc) = docs.get_mut(uri) else {
+        return Vec::new();
+    };
+    let path = file_path(uri);
+    let analysis = analyzer.analyze(path.as_deref(), doc.index.text(), &overlays);
+    doc.diags = analysis.diagnostics.clone();
+    let own = to_lsp(uri, &doc.index, analysis.diagnostics);
 
     // Only on success. A failed parse leaves the previous check in place; see `Doc`.
     if analysis.checked.is_some() {
         doc.checked = analysis.checked;
     }
 
-    Notification::new(
+    let mut notes = vec![Notification::new(
         PublishDiagnostics::METHOD.to_string(),
-        PublishDiagnosticsParams { uri: uri.clone(), diagnostics, version: None },
-    )
+        PublishDiagnosticsParams {
+            uri: uri.clone(),
+            diagnostics: own,
+            version: None,
+        },
+    )];
+    for (fpath, text, ds) in analysis.foreign {
+        let Ok(furl) = url::Url::from_file_path(&fpath) else {
+            continue;
+        };
+        let Ok(furi) = furl.as_str().parse::<Uri>() else {
+            continue;
+        };
+        // The owning file may itself be open; update its stored diagnostics so a
+        // quick-fix request there matches what the panel shows.
+        if let Some(fdoc) = docs.get_mut(&furi) {
+            fdoc.diags = ds.clone();
+        }
+        let index = LineIndex::new(&text);
+        let diagnostics = to_lsp(&furi, &index, ds);
+        notes.push(Notification::new(
+            PublishDiagnostics::METHOD.to_string(),
+            PublishDiagnosticsParams {
+                uri: furi,
+                diagnostics,
+                version: None,
+            },
+        ));
+    }
+    notes
 }
 
 /// The quick-fixes for the diagnostics under the requested range.
@@ -496,9 +591,10 @@ fn code_actions(
             // The stale-write warning: opt the enclosing fn out. The lint code is the
             // compiler's typed name for it, which is what makes this keyable at all.
             (None, Some("stale_write")) => {
-                let Some(checked) = &doc.checked else { continue };
-                let Some(decl_start) = enclosing_fn_start(&checked.module.decls, &d.span)
-                else {
+                let Some(checked) = &doc.checked else {
+                    continue;
+                };
+                let Some(decl_start) = enclosing_fn_start(&checked.module.decls, &d.span) else {
                     continue;
                 };
                 let line_start = index.text()[..decl_start]
@@ -563,13 +659,19 @@ fn quick_fix(
     at: lsp_types::Position,
     insert: String,
 ) -> lsp_types::CodeActionOrCommand {
-    let edit = lsp_types::TextEdit { range: Range { start: at, end: at }, new_text: insert };
+    let edit = lsp_types::TextEdit {
+        range: Range { start: at, end: at },
+        new_text: insert,
+    };
     let mut changes = HashMap::new();
     changes.insert(uri.clone(), vec![edit]);
     lsp_types::CodeActionOrCommand::CodeAction(lsp_types::CodeAction {
         title,
         kind: Some(lsp_types::CodeActionKind::QUICKFIX),
-        edit: Some(lsp_types::WorkspaceEdit { changes: Some(changes), ..Default::default() }),
+        edit: Some(lsp_types::WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
         ..Default::default()
     })
 }
@@ -639,7 +741,10 @@ fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analy
             let checked = doc.checked.as_mut()?;
             let (contents, range) = features::hover(analyzer, checked, &doc.index, pos)?;
             let _ = uri;
-            Some(Hover { contents: HoverContents::Markup(contents), range: Some(range) })
+            Some(Hover {
+                contents: HoverContents::Markup(contents),
+                range: Some(range),
+            })
         }),
 
         GotoDefinition::METHOD => answer::<GotoDefinition>(req, docs, |doc, uri, pos| {
@@ -654,7 +759,10 @@ fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analy
             Some(
                 ranges
                     .into_iter()
-                    .map(|range| Location { uri: uri.clone(), range })
+                    .map(|range| Location {
+                        uri: uri.clone(),
+                        range,
+                    })
                     .collect::<Vec<_>>(),
             )
         }),
@@ -669,10 +777,12 @@ fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analy
             )))
         }),
 
-        SignatureHelpRequest::METHOD => answer::<SignatureHelpRequest>(req, docs, |doc, uri, pos| {
-            let _ = uri;
-            features::signature_help(doc.checked.as_mut()?, &doc.index, pos)
-        }),
+        SignatureHelpRequest::METHOD => {
+            answer::<SignatureHelpRequest>(req, docs, |doc, uri, pos| {
+                let _ = uri;
+                features::signature_help(doc.checked.as_mut()?, &doc.index, pos)
+            })
+        }
 
         DocumentSymbolRequest::METHOD => match cast::<DocumentSymbolRequest>(req) {
             Ok((id, params)) => {
@@ -680,7 +790,10 @@ fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analy
                     .get(&params.text_document.uri)
                     .and_then(|doc| doc.checked.as_ref().map(|c| (c, &doc.index)))
                     .map(|(c, index)| {
-                        features::document_symbols(c, index).iter().map(to_symbol).collect()
+                        features::document_symbols(c, index)
+                            .iter()
+                            .map(to_symbol)
+                            .collect()
                     })
                     .unwrap_or_default();
                 Response::new_ok(id, DocumentSymbolResponse::Nested(symbols))
@@ -694,7 +807,9 @@ fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analy
                     .get_mut(&params.text_document.uri)
                     .and_then(|doc| {
                         let index = &doc.index;
-                        doc.checked.as_mut().map(|c| features::inlay_hints(c, index))
+                        doc.checked
+                            .as_mut()
+                            .map(|c| features::inlay_hints(c, index))
                     })
                     .unwrap_or_default()
                     .into_iter()
@@ -723,7 +838,10 @@ fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analy
                     .unwrap_or_default();
                 Response::new_ok(
                     id,
-                    SemanticTokensResult::Tokens(SemanticTokens { result_id: None, data }),
+                    SemanticTokensResult::Tokens(SemanticTokens {
+                        result_id: None,
+                        data,
+                    }),
                 )
             }
             Err(err) => err,
@@ -782,9 +900,15 @@ fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analy
 /// one with no parent, so it has to exist before the one inside it can point at it.
 fn chain(mut ranges: Vec<Range>) -> Option<SelectionRange> {
     let outermost = ranges.pop()?;
-    let mut node = SelectionRange { range: outermost, parent: None };
+    let mut node = SelectionRange {
+        range: outermost,
+        parent: None,
+    };
     while let Some(range) = ranges.pop() {
-        node = SelectionRange { range, parent: Some(Box::new(node)) };
+        node = SelectionRange {
+            range,
+            parent: Some(Box::new(node)),
+        };
     }
     Some(node)
 }
@@ -813,7 +937,10 @@ where
     // Every one of these requests has an `Option` result, whose `Default` is `None` and
     // serialises to `null` — which is exactly the "nothing here" answer, so an unknown
     // document needs no special case.
-    let result = docs.get_mut(&uri).map(|doc| f(doc, &uri, pos)).unwrap_or_default();
+    let result = docs
+        .get_mut(&uri)
+        .map(|doc| f(doc, &uri, pos))
+        .unwrap_or_default();
     Response::new_ok(id, result)
 }
 
@@ -844,10 +971,21 @@ fn answer_rename(req: Request, docs: &mut Documents, analyzer: &analysis::Analyz
         );
     };
 
-    let edits: Vec<TextEdit> =
-        ranges.into_iter().map(|range| TextEdit { range, new_text: params.new_name.clone() }).collect();
+    let edits: Vec<TextEdit> = ranges
+        .into_iter()
+        .map(|range| TextEdit {
+            range,
+            new_text: params.new_name.clone(),
+        })
+        .collect();
     let changes = std::collections::HashMap::from([(uri, edits)]);
-    Response::new_ok(id, WorkspaceEdit { changes: Some(changes), ..Default::default() })
+    Response::new_ok(
+        id,
+        WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        },
+    )
 }
 
 /// One outline entry, converted for the wire.
@@ -933,7 +1071,13 @@ fn format_document(id: RequestId, params: DocumentFormattingParams, docs: &Docum
     }
     let end = index.position(index.text().len());
     let edit = TextEdit {
-        range: Range { start: lsp_types::Position { line: 0, character: 0 }, end },
+        range: Range {
+            start: lsp_types::Position {
+                line: 0,
+                character: 0,
+            },
+            end,
+        },
         new_text: formatted,
     };
     Response::new_ok(id, vec![edit])

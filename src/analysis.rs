@@ -137,11 +137,42 @@ struct Cached {
 /// that, and `env` is what turns a `TyId` back into something printable. A query needs all
 /// three, so they travel together.
 pub struct Checked {
-    /// The user's module, expanded and numbered — the same AST the checker saw, so an
-    /// `ExprId` from `result` indexes into it.
+    /// The analyzed document's module, expanded and numbered — the same AST the checker
+    /// saw, so an `ExprId` from `result` indexes into it. In a project this is the OPEN
+    /// document's module, which need not be the entry.
     pub module: ast::Module,
     pub result: TypecheckResult,
     pub env: Env,
+    /// The other project files of this run — entry and sibling modules, never the
+    /// analyzed document itself — so a jump or hover into `util::helper` can open
+    /// `src/util.neon` exactly as one into `io::println` opens the stdlib's file.
+    /// Empty outside a project.
+    pub sources: Vec<Source>,
+}
+
+impl Checked {
+    /// The file a module was declared in: this run's project files first, the session's
+    /// stdlib second. One lookup for every feature, so none of them can know about only
+    /// half the world.
+    ///
+    /// Exact match first; failing that, the LONGEST non-empty prefix — a declaration
+    /// inside `internal mod raw` of `std::string` carries the module
+    /// `["std","string","raw"]`, and the file that holds it is `std/string.neon`. The
+    /// entry's empty path is never used as a prefix: it would claim every module in
+    /// existence, and "no file" (meaning: the document being edited) is the honest
+    /// answer when nothing longer matched.
+    pub fn source_of<'a>(
+        &'a self,
+        analyzer: &'a Analyzer,
+        module: &[String],
+    ) -> Option<&'a Source> {
+        let all = || self.sources.iter().chain(analyzer.sources());
+        all().find(|s| s.module == module).or_else(|| {
+            all()
+                .filter(|s| !s.module.is_empty() && module.starts_with(&s.module))
+                .max_by_key(|s| s.module.len())
+        })
+    }
 }
 
 /// The front end, bound to one session's stdlib.
@@ -159,8 +190,71 @@ pub struct Analyzer {
 /// answers hover and jumps from that, because a hover that blanks out every time a
 /// half-typed line fails to parse is a hover nobody trusts.
 pub struct Analysis {
+    /// The analyzed document's own diagnostics.
     pub diagnostics: Vec<Diagnostic>,
+    /// Diagnostics belonging to OTHER project files, one entry per file whether it has
+    /// any or not — publishing an empty list is how a fixed error leaves the editor's
+    /// problems panel. The text is the text the spans index, carried so the server can
+    /// turn byte offsets into positions without re-reading a file that may have moved
+    /// on. Empty outside a project.
+    pub foreign: Vec<(PathBuf, String, Vec<Diagnostic>)>,
     pub checked: Option<Checked>,
+}
+
+/// A project as the analyzer sees it: the manifest's directory and every `src/**/*.neon`.
+struct Layout {
+    /// `(src-relative path, absolute path)`, sorted; the entry `main.neon` included.
+    files: Vec<(String, PathBuf)>,
+}
+
+/// The project containing `doc`, found the way the CLI finds it: walk up to a
+/// `neon.toml`, take `src/` beneath it. `None` — no manifest, or the document is not
+/// under that project's `src/` — means single-file analysis, which is what a scratch
+/// buffer wants.
+fn discover(doc: &Path) -> Option<Layout> {
+    let mut dir = doc.parent();
+    let root = loop {
+        let d = dir?;
+        if d.join("neon.toml").is_file() {
+            break d;
+        }
+        dir = d.parent();
+    };
+    let src = root.join("src");
+    doc.strip_prefix(&src).ok()?;
+    let mut files = Vec::new();
+    collect_neon(&src, &src, &mut files);
+    files.sort();
+    Some(Layout { files })
+}
+
+fn collect_neon(src_root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.is_dir() {
+            collect_neon(src_root, &path, out);
+        } else if path.extension().is_some_and(|e| e == "neon") {
+            let rel = path
+                .strip_prefix(src_root)
+                .expect("collected under src")
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, path));
+        }
+    }
+}
+
+/// The module a project file declares: the entry is the root (anonymous) module, every
+/// other file is named by its path — `util.neon` is `util` — the same rule the stdlib
+/// follows, because it is the same `module_path`.
+fn module_of(rel: &str) -> Vec<String> {
+    if rel == "main.neon" {
+        Vec::new()
+    } else {
+        stdlib::module_path(rel)
+    }
 }
 
 impl Analyzer {
@@ -189,7 +283,14 @@ impl Analyzer {
             })
             .collect();
 
-        Ok(Analyzer { cached: Some(Cached { modules, next_id, sources }), config: config() })
+        Ok(Analyzer {
+            cached: Some(Cached {
+                modules,
+                next_id,
+                sources,
+            }),
+            config: config(),
+        })
     }
 
     /// Lexer and parser diagnostics only, for a session with no usable toolchain.
@@ -198,28 +299,48 @@ impl Analyzer {
     /// `std` in scope every single name in a normal file is undefined, and the resulting
     /// wall of red says nothing true about the user's code.
     pub fn syntax_only() -> Analyzer {
-        Analyzer { cached: None, config: config() }
+        Analyzer {
+            cached: None,
+            config: config(),
+        }
     }
 
-    /// The stdlib files, for turning a `DefSite` into a location.
+    /// The stdlib files, for turning a `DefSite` into a location. Project files are
+    /// per-run and live on `Checked::sources`; `Checked::source_of` is the lookup that
+    /// consults both.
     pub fn sources(&self) -> &[Source] {
-        self.cached.as_ref().map(|c| c.sources.as_slice()).unwrap_or_default()
-    }
-
-    /// The stdlib file a module was declared in.
-    pub fn source_of(&self, module: &[String]) -> Option<&Source> {
-        self.sources().iter().find(|s| s.module == module)
+        self.cached
+            .as_ref()
+            .map(|c| c.sources.as_slice())
+            .unwrap_or_default()
     }
 
     /// Everything the front end can say about one file, in pipeline order.
-    pub fn analyze(&self, src: &str) -> Analysis {
-        let bail = |d: Vec<Diagnostic>| Analysis { diagnostics: d, checked: None };
+    ///
+    /// `doc_path` is where the document lives, when it lives anywhere: it is how the
+    /// analyzer finds the project around it. `overlays` are the other OPEN documents'
+    /// current texts — the editor's copy is authoritative, and a sibling module open in
+    /// the next split may be several keystrokes ahead of its file on disk.
+    pub fn analyze(
+        &self,
+        doc_path: Option<&Path>,
+        src: &str,
+        overlays: &[(PathBuf, String)],
+    ) -> Analysis {
+        let bail = |d: Vec<Diagnostic>| Analysis {
+            diagnostics: d,
+            foreign: Vec::new(),
+            checked: None,
+        };
 
         let tokens = match lexer::lex(src) {
             Ok(t) => t,
             Err(errors) => {
                 return bail(
-                    errors.iter().map(|e| Diagnostic::plain(e.span.clone(), e.to_string())).collect(),
+                    errors
+                        .iter()
+                        .map(|e| Diagnostic::plain(e.span.clone(), e.to_string()))
+                        .collect(),
                 )
             }
         };
@@ -227,10 +348,15 @@ impl Analyzer {
         let (module, errors) = parser::parse(&tokens, src.len());
         if !errors.is_empty() {
             return bail(
-                errors.iter().map(|e| Diagnostic::plain(e.span.clone(), e.to_string())).collect(),
+                errors
+                    .iter()
+                    .map(|e| Diagnostic::plain(e.span.clone(), e.to_string()))
+                    .collect(),
             );
         }
-        let Some(mut module) = module else { return bail(Vec::new()) };
+        let Some(mut module) = module else {
+            return bail(Vec::new());
+        };
 
         let (expanded, _meta, expand_errors) = expand::expand(module, &self.config);
         if !expand_errors.is_empty() {
@@ -243,59 +369,211 @@ impl Analyzer {
         }
         module = expanded;
 
-        let Some(cached) = &self.cached else { return bail(Vec::new()) };
+        let Some(cached) = &self.cached else {
+            return bail(Vec::new());
+        };
 
-        // Numbering the stdlib first and the user's module after it keeps every `ExprId`
-        // in the compilation unique, which is what lets one `TypecheckResult` cover both.
-        ast::number_exprs_from(&mut module, cached.next_id);
+        // The project around the document, when there is one. Each sibling file — the
+        // entry included — becomes the module its path names, its text taken from an
+        // open buffer when the editor has one and from disk otherwise. A sibling that
+        // does not parse is SKIPPED, not fatal: its own window is already showing its
+        // errors, and this document's analysis is worth more degraded than absent.
+        let doc = doc_path.and_then(|p| std::fs::canonicalize(p).ok());
+        let layout = doc.as_ref().and_then(|p| discover(p));
+        let mut doc_module: Vec<String> = Vec::new();
+        let mut sibling_modules: Vec<(Vec<String>, ast::Module)> = Vec::new();
+        let mut sources: Vec<Source> = Vec::new();
+        if let (Some(layout), Some(doc)) = (&layout, &doc) {
+            for (rel, abs) in &layout.files {
+                let canonical = std::fs::canonicalize(abs).unwrap_or_else(|_| abs.clone());
+                if &canonical == doc {
+                    doc_module = module_of(rel);
+                    continue;
+                }
+                let text = match overlays.iter().find(|(p, _)| p == &canonical) {
+                    Some((_, t)) => t.clone(),
+                    None => match std::fs::read_to_string(abs) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    },
+                };
+                let Some(m) = parse_quietly(&text, &self.config) else {
+                    continue;
+                };
+                let trivia = lexer::lex_full(&text).map(|l| l.trivia).unwrap_or_default();
+                sibling_modules.push((module_of(rel), m));
+                sources.push(Source {
+                    module: module_of(rel),
+                    path: abs.clone(),
+                    index: LineIndex::new(&text),
+                    trivia,
+                });
+            }
+        }
+
+        // Numbering: the stdlib first, siblings after it, this document last — every
+        // `ExprId` in the compilation unique, so one `TypecheckResult` covers all of it.
+        let mut next_id = cached.next_id;
+        for (_, m) in &mut sibling_modules {
+            next_id = ast::number_exprs_from(m, next_id);
+        }
+        ast::number_exprs_from(&mut module, next_id);
 
         let mut modules: Vec<(Vec<String>, &ast::Module)> =
             cached.modules.iter().map(|(p, m)| (p.clone(), m)).collect();
-        modules.push((Vec::new(), &module));
+        modules.extend(sibling_modules.iter().map(|(p, m)| (p.clone(), m)));
+        modules.push((doc_module.clone(), &module));
 
         // `RootApplication` because an editor is nearly always looking at a program: it is
         // the stricter of the two (a library has no `main` to demand), so this errs toward
         // showing a diagnostic rather than hiding one.
         let mut env = Env::build_with(&modules, Unit::RootApplication);
         if !env.errors().is_empty() {
-            return bail(env.errors().iter().map(convert).collect());
+            let errs = env.take_errors();
+            let (own, foreign) = route(
+                errs.iter().map(|e| (e.module.clone(), convert(e))),
+                &doc_module,
+                &sources,
+            );
+            return Analysis {
+                diagnostics: own,
+                foreign: with_text(foreign, &sources),
+                checked: None,
+            };
         }
 
         // Every diagnostic of the run, resolution errors included: `check_all` drains the
         // environment's channel into what it returns, so an unknown type written inside a
         // body reaches the editor rather than vanishing.
         //
-        // Only errors whose module is the root belong to THIS document. An error
-        // raised in a stdlib module carries a span into that module's source; anchored
-        // here it would underline whatever token happens to sit at the same byte
-        // offset in the user's file. A broken stdlib is a broken toolchain, not
-        // something the open buffer can fix, so those are dropped rather than
-        // mis-attached.
+        // An error belongs to the module it was raised in. This document's land here; a
+        // sibling project file's are routed to that file (the editor shows them on it,
+        // open or not); a stdlib module's are dropped — anchored here they would
+        // underline whatever token sits at the same byte offset, and a broken stdlib is
+        // a broken toolchain, not something any buffer can fix.
         let (result, errs) = neon_compiler::typecheck::check::check_all(&mut env, &modules);
-        let mut diagnostics: Vec<Diagnostic> =
-            errs.iter().filter(|e| e.module.is_empty()).map(convert).collect();
+        let (mut diagnostics, mut foreign) = route(
+            errs.iter().map(|e| (e.module.clone(), convert(e))),
+            &doc_module,
+            &sources,
+        );
 
-        // The checker's warnings, on the same terms as its errors: root-module only —
-        // a stdlib warning carries a span into the stdlib's own source, and there is
-        // nothing the open buffer can do about it. A warning never blocks `checked`
-        // below, so hover and navigation still come from a warned-but-clean check.
-        diagnostics.extend(result.warnings.iter().filter(|w| w.module.is_empty()).map(|w| {
-            Diagnostic {
-                span: w.span.clone(),
-                message: w.message.clone(),
-                labels: Vec::new(),
-                help: None,
-                severity: Severity::Warning,
-                code: Some(w.lint.name()),
-                fix: None,
-            }
-        }));
+        // The checker's warnings, routed on the same terms as its errors. A warning
+        // never blocks `checked` below, so hover and navigation still come from a
+        // warned-but-clean check.
+        let (own_warns, foreign_warns) = route(
+            result.warnings.iter().map(|w| {
+                (
+                    w.module.clone(),
+                    Diagnostic {
+                        span: w.span.clone(),
+                        message: w.message.clone(),
+                        labels: Vec::new(),
+                        help: None,
+                        severity: Severity::Warning,
+                        code: Some(w.lint.name()),
+                        fix: None,
+                    },
+                )
+            }),
+            &doc_module,
+            &sources,
+        );
+        diagnostics.extend(own_warns);
+        // `route` returns one entry per source, in source order, so the two zip.
+        for ((_, ds), (_, extra)) in foreign.iter_mut().zip(foreign_warns) {
+            ds.extend(extra);
+        }
 
         // `modules` borrows `module`, and `Checked` owns it — so the borrow has to end
         // before the move. Nothing above needs it past this point.
         drop(modules);
-        Analysis { diagnostics, checked: Some(Checked { module, result, env }) }
+        let foreign = with_text(foreign, &sources);
+        Analysis {
+            diagnostics,
+            foreign,
+            checked: Some(Checked {
+                module,
+                result,
+                env,
+                sources,
+            }),
+        }
     }
+}
+
+/// Lex, parse and expand a sibling project file, with no diagnostics: its own editor
+/// window is where its errors belong, and this run only wants its declarations.
+fn parse_quietly(text: &str, config: &expand::Config) -> Option<ast::Module> {
+    let tokens = lexer::lex(text).ok()?;
+    let (module, errors) = parser::parse(&tokens, text.len());
+    if !errors.is_empty() {
+        return None;
+    }
+    let (expanded, _meta, expand_errors) = expand::expand(module?, config);
+    if !expand_errors.is_empty() {
+        return None;
+    }
+    Some(expanded)
+}
+
+/// Split diagnostics between the analyzed document and the project files they belong to.
+/// Every project file gets an entry, EMPTY when it is clean — publishing nothing is how
+/// a fixed error leaves the problems panel. A stdlib module's match no source here and
+/// are dropped: anchored to any buffer they would underline an unrelated token, and a
+/// broken stdlib is a broken toolchain.
+fn route(
+    items: impl Iterator<Item = (Vec<String>, Diagnostic)>,
+    doc_module: &[String],
+    sources: &[Source],
+) -> (Vec<Diagnostic>, Vec<(PathBuf, Vec<Diagnostic>)>) {
+    let mut own = Vec::new();
+    let mut foreign: Vec<(PathBuf, Vec<Diagnostic>)> = sources
+        .iter()
+        .map(|s| (s.path.clone(), Vec::new()))
+        .collect();
+    for (module, d) in items {
+        // Exact file first; then the longest non-empty prefix, because an error inside
+        // `util`'s `internal mod raw` carries `["util","raw"]` and the file that holds
+        // it is `util.neon`. The entry's empty path never matches as a prefix — it
+        // would claim everything.
+        if module == doc_module {
+            own.push(d);
+            continue;
+        }
+        if let Some(i) = sources.iter().position(|s| s.module == module) {
+            foreign[i].1.push(d);
+            continue;
+        }
+        let doc_len =
+            (!doc_module.is_empty() && module.starts_with(doc_module)).then_some(doc_module.len());
+        let best = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.module.is_empty() && module.starts_with(&s.module))
+            .max_by_key(|(_, s)| s.module.len());
+        match (doc_len, best) {
+            (Some(dl), Some((i, s))) if s.module.len() > dl => foreign[i].1.push(d),
+            (Some(_), _) => own.push(d),
+            (None, Some((i, _))) => foreign[i].1.push(d),
+            // A stdlib module's: dropped, not mis-attached.
+            (None, None) => {}
+        }
+    }
+    (own, foreign)
+}
+
+/// Attach each foreign file's text to its diagnostics; `route` returns one entry per
+/// source in source order, which is what makes the zip sound.
+fn with_text(
+    foreign: Vec<(PathBuf, Vec<Diagnostic>)>,
+    sources: &[Source],
+) -> Vec<(PathBuf, String, Vec<Diagnostic>)> {
+    foreign
+        .into_iter()
+        .zip(sources)
+        .map(|((path, ds), s)| (path, s.index.text().to_string(), ds))
+        .collect()
 }
 
 /// The active `@cfg` keys are this machine's, matching what a build here would do. An
@@ -316,10 +594,14 @@ fn convert(e: &neon_compiler::typecheck::env::TypeError) -> Diagnostic {
     // unknown name. DidYouMean stays a help line — replacing what the user typed is a
     // judgement, adding an import is not.
     let fix = match &e.kind {
-        TypeErrorKind::UnknownName { suggestion: Some(Suggestion::AddUse { path, .. }), .. }
-        | TypeErrorKind::Unknown { suggestion: Some(Suggestion::AddUse { path, .. }), .. } => {
-            Some(Fix::InsertUse(path.clone()))
+        TypeErrorKind::UnknownName {
+            suggestion: Some(Suggestion::AddUse { path, .. }),
+            ..
         }
+        | TypeErrorKind::Unknown {
+            suggestion: Some(Suggestion::AddUse { path, .. }),
+            ..
+        } => Some(Fix::InsertUse(path.clone())),
         _ => None,
     };
     Diagnostic {
@@ -330,5 +612,148 @@ fn convert(e: &neon_compiler::typecheck::env::TypeError) -> Diagnostic {
         severity: Severity::Error,
         code: None,
         fix,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analyzer() -> Analyzer {
+        let dir = std::env::var_os("NEON_STDLIB")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../neon/stdlib")
+            });
+        let mut sources = Vec::new();
+        collect(&dir, &dir, &mut sources);
+        sources.sort();
+        assert!(!sources.is_empty(), "no stdlib found at {}", dir.display());
+        Analyzer::new(&dir, &sources).expect("the stdlib parses")
+    }
+
+    fn collect(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).expect("readable") {
+            let path = entry.expect("readable").path();
+            if path.is_dir() {
+                collect(root, &path, out);
+            } else if path.extension().is_some_and(|e| e == "neon") {
+                let rel = path.strip_prefix(root).expect("under root");
+                let text = std::fs::read_to_string(&path).expect("readable");
+                out.push((rel.to_string_lossy().replace('\\', "/"), text));
+            }
+        }
+    }
+
+    /// A throwaway project on disk; analysis discovers it from the document's path.
+    fn project(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("neon_lsp_project_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+        std::fs::write(dir.join("neon.toml"), "[package]\nname = \"app\"\n").expect("manifest");
+        for (rel, text) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdirs");
+            std::fs::write(&p, text).expect("write");
+        }
+        dir
+    }
+
+    const ENTRY: &str =
+        "use std::io;\nuse util;\n\nfn main() {\n    io::println(util::greet());\n}\n";
+    const UTIL: &str = "fn greet() -> str { \"hi\" }\n";
+
+    #[test]
+    fn a_module_resolves_its_siblings() {
+        let dir = project(
+            "resolves",
+            &[("src/main.neon", ENTRY), ("src/util.neon", UTIL)],
+        );
+        let a = analyzer();
+
+        // The entry sees the module...
+        let entry = a.analyze(Some(&dir.join("src/main.neon")), ENTRY, &[]);
+        assert!(
+            entry.diagnostics.is_empty(),
+            "{:?}",
+            entry
+                .diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+        // ...and its check knows which file `util` is, so a jump can open it.
+        let checked = entry.checked.expect("clean check");
+        let src = checked
+            .source_of(&a, &["util".to_string()])
+            .expect("util has a file");
+        assert!(src.path.ends_with("util.neon"));
+
+        // The module, analyzed as the open document, sees the entry the same way.
+        let util = a.analyze(Some(&dir.join("src/util.neon")), UTIL, &[]);
+        assert!(util.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_siblings_error_is_routed_to_its_file_not_mine() {
+        // The signature stays `str`, so the entry's call remains well-typed and the
+        // one error in the program is inside util's body.
+        let broken = "fn greet() -> str { 41 }\n";
+        let dir = project(
+            "routes",
+            &[("src/main.neon", ENTRY), ("src/util.neon", broken)],
+        );
+        let a = analyzer();
+
+        let entry = a.analyze(Some(&dir.join("src/main.neon")), ENTRY, &[]);
+        assert!(
+            entry.diagnostics.is_empty(),
+            "the entry did nothing wrong: {:?}",
+            entry
+                .diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+        let (path, _, ds) = entry
+            .foreign
+            .iter()
+            .find(|(p, _, _)| p.ends_with("util.neon"))
+            .expect("util.neon has an entry");
+        assert!(path.ends_with("util.neon"));
+        assert_eq!(ds.len(), 1, "{ds:?}");
+    }
+
+    #[test]
+    fn an_open_buffer_overlays_its_disk_file() {
+        let broken = "fn greet() -> str { 41 }\n";
+        let dir = project(
+            "overlays",
+            &[("src/main.neon", ENTRY), ("src/util.neon", broken)],
+        );
+        let a = analyzer();
+
+        // util.neon is broken on disk, but the editor's buffer has fixed it: the
+        // analysis of main must see the buffer, not the file.
+        let util_path = std::fs::canonicalize(dir.join("src/util.neon")).expect("exists");
+        let overlays = vec![(util_path, UTIL.to_string())];
+        let entry = a.analyze(Some(&dir.join("src/main.neon")), ENTRY, &overlays);
+        assert!(entry.diagnostics.is_empty());
+        let (_, _, ds) = entry
+            .foreign
+            .iter()
+            .find(|(p, _, _)| p.ends_with("util.neon"))
+            .expect("util.neon has an entry");
+        assert!(ds.is_empty(), "the overlay fixed it: {ds:?}");
+    }
+
+    #[test]
+    fn a_lone_file_is_not_a_project() {
+        let a = analyzer();
+        let lone = "use std::io;\nfn main() { io::println(\"hi\"); }\n";
+        let out = a.analyze(None, lone, &[]);
+        assert!(out.diagnostics.is_empty());
+        assert!(out.foreign.is_empty());
+        assert!(out.checked.expect("clean").sources.is_empty());
     }
 }

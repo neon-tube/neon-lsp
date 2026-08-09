@@ -37,7 +37,11 @@ impl Failure {
                 "neon-lsp cannot find the `neon` compiler, so it can only report syntax \
                  errors — type errors will not appear. Looked in: {}. \
                  Put `neon` on PATH, or set NEON_LSP_COMPILER to its full path.",
-                looked.iter().map(|p| format!("'{}'", p.display())).collect::<Vec<_>>().join(", ")
+                looked
+                    .iter()
+                    .map(|p| format!("'{}'", p.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Failure::Unusable { program, reason } => format!(
                 "neon-lsp found `{}` but it reported no usable stdlib, so only syntax errors \
@@ -174,7 +178,9 @@ fn condense(stderr: &str) -> String {
         let line = line.strip_prefix("Error:").unwrap_or(line).trim();
         // `0: the message` — drop the index, keep the message.
         let line = match line.split_once(": ") {
-            Some((n, rest)) if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => rest.trim(),
+            Some((n, rest)) if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => {
+                rest.trim()
+            }
             _ => line,
         };
         if line.is_empty() {

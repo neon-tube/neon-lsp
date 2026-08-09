@@ -24,7 +24,10 @@ impl LineIndex {
     pub fn new(text: &str) -> LineIndex {
         let mut starts = vec![0];
         starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
-        LineIndex { starts, text: text.to_string() }
+        LineIndex {
+            starts,
+            text: text.to_string(),
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -42,7 +45,10 @@ impl LineIndex {
         // Only the part of the line before the offset counts, and it counts in UTF-16.
         let prefix = &self.text[line_start..offset];
         let character = prefix.chars().map(char::len_utf16).sum::<usize>();
-        Position { line: line as u32, character: character as u32 }
+        Position {
+            line: line as u32,
+            character: character as u32,
+        }
     }
 
     /// The byte offset of a position — `position` run backwards.
@@ -90,14 +96,32 @@ mod tests {
         // count 2, and both would be wrong.
         let idx = LineIndex::new("é🙂x");
         let offset = "é🙂".len();
-        assert_eq!(idx.position(offset), Position { line: 0, character: 3 });
+        assert_eq!(
+            idx.position(offset),
+            Position {
+                line: 0,
+                character: 3
+            }
+        );
     }
 
     #[test]
     fn positions_are_relative_to_their_own_line() {
         let idx = LineIndex::new("ab\ncd\nef");
-        assert_eq!(idx.position(4), Position { line: 1, character: 1 });
-        assert_eq!(idx.position(6), Position { line: 2, character: 0 });
+        assert_eq!(
+            idx.position(4),
+            Position {
+                line: 1,
+                character: 1
+            }
+        );
+        assert_eq!(
+            idx.position(6),
+            Position {
+                line: 2,
+                character: 0
+            }
+        );
     }
 
     #[test]
@@ -114,7 +138,11 @@ mod tests {
         let text = "fn f() {\n  let é = \"🙂\";\n  é\n}\n";
         let idx = LineIndex::new(text);
         for offset in text.char_indices().map(|(i, _)| i) {
-            assert_eq!(idx.offset(idx.position(offset)), offset, "offset {offset} drifted");
+            assert_eq!(
+                idx.offset(idx.position(offset)),
+                offset,
+                "offset {offset} drifted"
+            );
         }
     }
 
@@ -123,7 +151,13 @@ mod tests {
         // Same fixture as the forward test: the emoji is two UTF-16 units, so character
         // 3 is the `x` at byte 6. A byte-counting implementation would land mid-emoji.
         let idx = LineIndex::new("é🙂x");
-        assert_eq!(idx.offset(Position { line: 0, character: 3 }), "é🙂".len());
+        assert_eq!(
+            idx.offset(Position {
+                line: 0,
+                character: 3
+            }),
+            "é🙂".len()
+        );
     }
 
     #[test]
@@ -131,12 +165,24 @@ mod tests {
         // Where the cursor sits after the last character of a line. It must not run on
         // into the next line, or hover at end-of-line would report the wrong statement.
         let idx = LineIndex::new("ab\ncd");
-        assert_eq!(idx.offset(Position { line: 0, character: 99 }), 3);
+        assert_eq!(
+            idx.offset(Position {
+                line: 0,
+                character: 99
+            }),
+            3
+        );
     }
 
     #[test]
     fn a_line_that_does_not_exist_clamps_to_the_end() {
         let idx = LineIndex::new("ab\n");
-        assert_eq!(idx.offset(Position { line: 99, character: 0 }), 3);
+        assert_eq!(
+            idx.offset(Position {
+                line: 99,
+                character: 0
+            }),
+            3
+        );
     }
 }
