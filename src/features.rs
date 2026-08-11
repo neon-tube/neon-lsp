@@ -1086,11 +1086,16 @@ fn main() {
             labels.contains(&"add"),
             "the file's own function is missing"
         );
-        // And the detail is the signature, which is the point of offering it.
+        // And the detail is the signature, which is the point of offering it. The stdlib
+        // now also has an `add` (`std::set::add`), so pick the file's OWN -- the bare one,
+        // whose `sort_text` starts "0" (qualified names sort under "1"). Both are offered;
+        // the editor shows the bare one first, which is what this asserts.
         let add = items
             .iter()
-            .find(|i| i.label == "add")
-            .expect("`add` is offered");
+            .find(|i| {
+                i.label == "add" && i.sort_text.as_deref().is_some_and(|s| s.starts_with('0'))
+            })
+            .expect("the file's own `add` is offered");
         assert_eq!(add.detail.as_deref(), Some("fn add(a: i64, b: i64) -> i64"));
     }
 
