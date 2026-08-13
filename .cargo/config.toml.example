@@ -1,0 +1,10 @@
+# Local development override: build neon-lsp against a sibling ../neon compiler checkout
+# instead of cloning neon.git, so a compiler change is visible the moment it builds.
+#
+#   cp .cargo/config.toml.example .cargo/config.toml
+#
+# `.cargo/config.toml` is gitignored, so this override applies ONLY in a dev tree that has
+# the sibling. A fresh `cargo install --git` has no config and resolves neon-compiler from
+# the git dependency in Cargo.toml -- which is why it now works.
+[patch."https://github.com/neon-tube/neon.git"]
+neon-compiler = { path = "../neon/compiler" }

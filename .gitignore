@@ -1,1 +1,4 @@
 /target
+
+# Local dev compiler override (see .cargo/config.toml.example)
+.cargo/config.toml

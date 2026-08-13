@@ -32,8 +32,10 @@ neon-compiler = { git = "https://github.com/neon-tube/neon.git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Development rides the sibling checkout, so a compiler change (a new warning, a
-# reshaped result) is visible here the moment it builds — the git dependency above
-# stays the deployment story, and `[patch]` swaps it out only when ../neon exists.
-[patch."https://github.com/neon-tube/neon.git"]
-neon-compiler = { path = "../neon/compiler" }
+# The dev override that builds against a sibling ../neon checkout lives in
+# `.cargo/config.toml` (gitignored; copy it from `.cargo/config.toml.example`), NOT here. A
+# committed `[patch = { path = "../neon/compiler" }]` is unconditional -- it does not "only
+# apply when ../neon exists" -- so it broke `cargo install --git` outright: cargo clones this
+# repo alone, the sibling path is absent, and `neon-compiler` fails to resolve. The git
+# dependency above is the one source everyone resolves; the config-level patch overrides it
+# only where the sibling is actually present.
